@@ -424,6 +424,56 @@ rejected (`extra="forbid"`) so a typo cannot silently change behaviour.
 
 ---
 
+## Deployment
+
+Deployed on Vercel as a Python serverless function:
+
+- **Production URL:** <https://ciphervault-backend.vercel.app>
+- **Interactive docs:** <https://ciphervault-backend.vercel.app/docs>
+
+### How the routing works
+
+The entrypoint is `api/[...path].py`, not `api/index.py`. Vercel derives a
+function's route from its filename, so the catch-all `[...path]` maps every
+`/api/*` request onto the function **while preserving the original path**.
+FastAPI therefore sees `/api/health`, `/api/algorithms` and so on and matches
+its own routes.
+
+A plain `api/index.py` would only receive `/api` and return
+`404 Not Found` for everything else. Rewriting `/(.*)` to `/api` fails for the
+same reason: the path collapses before the app can route it.
+
+The file also prepends the repository root to `sys.path`, because a Vercel
+function runs with its own directory as the working directory.
+
+### Environment variables
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `CORS_ORIGINS` | in production | Comma-separated list of allowed browser origins. Unset, only the local Vite origins are allowed. |
+
+Set on the deployed project:
+
+```bash
+vercel env add CORS_ORIGINS production
+# https://ciphervault-frontend-self.vercel.app
+```
+
+### Redeploying
+
+```bash
+vercel deploy --prod --yes
+```
+
+Verify without the CLI:
+
+```bash
+curl https://ciphervault-backend.vercel.app/api/health
+# {"status":"ok","service":"cipherforge","version":"1.0.0"}
+```
+
+---
+
 ## Testing
 
 163 tests cover the service layer and the HTTP layer.
