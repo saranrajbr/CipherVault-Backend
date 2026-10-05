@@ -1,0 +1,216 @@
+"""AES-256-GCM authenticated encryption service.
+
+Implementation notes:
+    * AES is provided by the ``cryptography`` package. CipherForge never
+      implements a block cipher itself.
+    * GCM is authenticated: the 128-bit tag is appended to the ciphertext and is
+      verified on decryption, so tampering is rejected.
+    * Keys and nonces come from ``secrets`` (the OS CSPRNG), never ``random``.
+    * A nonce must never repeat under the same key. CipherForge generates a
+      fresh random 96-bit nonce per request and additionally keeps an in-process
+      ledger that refuses a repeat within the lifetime of the service.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import secrets
+import threading
+from dataclasses import dataclass
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from ..errors import DecryptionError, InvalidInputError
+
+KEY_SIZE_BYTES = 32
+NONCE_SIZE_BYTES = 12
+GCM_TAG_SIZE_BYTES = 16
+
+_USED_NONCES: dict[str, set[bytes]] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class AesParameters:
+    """A freshly generated AES key and nonce pair."""
+
+    key: bytes
+    nonce: bytes
+
+    @property
+    def key_hex(self) -> str:
+        """Key as lowercase hexadecimal, for frontend display."""
+        return self.key.hex()
+
+    @property
+    def nonce_hex(self) -> str:
+        """Nonce as lowercase hexadecimal, for frontend display."""
+        return self.nonce.hex()
+
+
+@dataclass(frozen=True, slots=True)
+class AesResult:
+    """Output of an AES-GCM encryption operation."""
+
+    ciphertext_b64: str
+    key_hex: str
+    nonce_hex: str
+
+
+def generate_parameters() -> AesParameters:
+    """Generate a cryptographically secure 256-bit key and 96-bit nonce."""
+    return AesParameters(
+        key=secrets.token_bytes(KEY_SIZE_BYTES),
+        nonce=secrets.token_bytes(NONCE_SIZE_BYTES),
+    )
+
+
+def reset_nonce_registry() -> None:
+    """Clear the in-process nonce ledger. Intended for tests only."""
+    with _REGISTRY_LOCK:
+        _USED_NONCES.clear()
+
+
+def _key_fingerprint(key: bytes) -> str:
+    """Identify a key inside the nonce ledger without storing the key itself."""
+    return hashlib.sha256(key).hexdigest()
+
+
+def _assert_nonce_is_fresh(key: bytes, nonce: bytes) -> None:
+    """Refuse to encrypt with a (key, nonce) pair that was already used.
+
+    Reusing a GCM nonce with the same key allows an attacker to recover
+    authentication subkey material and to forge tags, so it is treated as a
+    hard error rather than a warning.
+    """
+    fingerprint = _key_fingerprint(key)
+    with _REGISTRY_LOCK:
+        used = _USED_NONCES.setdefault(fingerprint, set())
+        if nonce in used:
+            raise InvalidInputError(
+                "Refusing to reuse an AES-GCM nonce with the same key. Generate fresh parameters.",
+                code="NONCE_REUSE",
+            )
+        used.add(nonce)
+
+
+def decode_hex_field(value: str, expected_bytes: int, field_name: str) -> bytes:
+    """Decode a hexadecimal request field into exactly ``expected_bytes`` bytes.
+
+    Args:
+        value: The hexadecimal string supplied by the client.
+        expected_bytes: Required byte length of the decoded value.
+        field_name: Human readable field name used in the error message.
+
+    Returns:
+        The decoded bytes.
+
+    Raises:
+        InvalidInputError: If the field is not valid hexadecimal or has the
+            wrong length.
+    """
+    candidate = value.strip()
+    if candidate.lower().startswith("0x"):
+        candidate = candidate[2:]
+    try:
+        raw = bytes.fromhex(candidate)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidInputError(
+            f"Invalid {field_name}: expected a hexadecimal string."
+        ) from exc
+    if len(raw) != expected_bytes:
+        raise InvalidInputError(
+            f"Invalid {field_name}: expected {expected_bytes} bytes "
+            f"({expected_bytes * 2} hexadecimal characters), received {len(raw)} bytes."
+        )
+    return raw
+
+
+def decode_ciphertext(value: str) -> bytes:
+    """Decode Base64 ciphertext supplied by the client.
+
+    Args:
+        value: Standard Base64 ciphertext including the GCM tag.
+
+    Returns:
+        The decoded ciphertext bytes.
+
+    Raises:
+        InvalidInputError: If the value is not valid Base64.
+    """
+    candidate = "".join(character for character in value.strip() if not character.isspace())
+    if not candidate:
+        raise InvalidInputError("Invalid ciphertext: value is empty.")
+    try:
+        return base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidInputError("Invalid ciphertext: expected valid Base64.") from exc
+
+
+def encrypt(plaintext: str, key: bytes, nonce: bytes) -> AesResult:
+    """Encrypt UTF-8 text with AES-256-GCM.
+
+    Args:
+        plaintext: Text to encrypt.
+        key: 32-byte AES key.
+        nonce: 12-byte nonce that must be unique for this key.
+
+    Returns:
+        The Base64 ciphertext (with appended tag) plus the key and nonce.
+
+    Raises:
+        InvalidInputError: If the key or nonce length is wrong, or the nonce
+            was already used with this key.
+    """
+    if len(key) != KEY_SIZE_BYTES:
+        raise InvalidInputError(f"Invalid key: AES-256-GCM requires a {KEY_SIZE_BYTES}-byte key.")
+    if len(nonce) != NONCE_SIZE_BYTES:
+        raise InvalidInputError(
+            f"Invalid nonce: AES-GCM requires a {NONCE_SIZE_BYTES}-byte (96-bit) nonce."
+        )
+    _assert_nonce_is_fresh(key, nonce)
+    sealed = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
+    return AesResult(
+        ciphertext_b64=base64.b64encode(sealed).decode("ascii"),
+        key_hex=key.hex(),
+        nonce_hex=nonce.hex(),
+    )
+
+
+def decrypt(ciphertext_b64: str, key: bytes, nonce: bytes) -> str:
+    """Decrypt and authenticate AES-256-GCM ciphertext.
+
+    Args:
+        ciphertext_b64: Base64 ciphertext including the 128-bit GCM tag.
+        key: The 32-byte AES key that was used to encrypt.
+        nonce: The 12-byte nonce that was used to encrypt.
+
+    Returns:
+        The decrypted UTF-8 text.
+
+    Raises:
+        DecryptionError: If the key, nonce or ciphertext is wrong, if the tag
+            fails verification, or if the plaintext is not valid UTF-8.
+    """
+    if len(key) != KEY_SIZE_BYTES:
+        raise InvalidInputError(f"Invalid key: AES-256-GCM requires a {KEY_SIZE_BYTES}-byte key.")
+    if len(nonce) != NONCE_SIZE_BYTES:
+        raise InvalidInputError(
+            f"Invalid nonce: AES-GCM requires a {NONCE_SIZE_BYTES}-byte (96-bit) nonce."
+        )
+    ciphertext = decode_ciphertext(ciphertext_b64)
+    if len(ciphertext) < GCM_TAG_SIZE_BYTES:
+        raise DecryptionError("Invalid ciphertext: too short to contain a GCM authentication tag.")
+    try:
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+    except InvalidTag as exc:
+        raise DecryptionError(
+            "Authentication failed: the ciphertext, key or nonce is incorrect, or the data was tampered with."
+        ) from exc
+    try:
+        return plaintext.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DecryptionError("Decryption succeeded but the result is not valid UTF-8 text.") from exc

@@ -1,0 +1,1 @@
+"""HTTP layer: FastAPI routers only. No cryptographic logic lives here."""
