@@ -461,6 +461,15 @@ vercel env add CORS_ORIGINS production
 
 ### Redeploying
 
+**Pushes deploy automatically** — the repository is connected to Vercel's Git
+integration, so a push to `main` builds and promotes itself:
+
+```bash
+git push origin main          # triggers a production build
+```
+
+To deploy manually instead:
+
 ```bash
 vercel deploy --prod --yes
 ```
